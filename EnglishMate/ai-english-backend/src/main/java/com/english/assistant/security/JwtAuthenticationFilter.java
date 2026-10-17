@@ -1,0 +1,9 @@
+package com.english.assistant.security;
+import jakarta.servlet.*; import jakarta.servlet.http.*; import org.springframework.security.authentication.UsernamePasswordAuthenticationToken; import org.springframework.security.core.context.SecurityContextHolder; import org.springframework.security.core.userdetails.*; import org.springframework.stereotype.Component; import org.springframework.web.filter.OncePerRequestFilter; import java.io.IOException;
+@Component public class JwtAuthenticationFilter extends OncePerRequestFilter {
+ private final JwtService jwt; private final UserDetailsService uds; public JwtAuthenticationFilter(JwtService j,UserDetailsService u){jwt=j;uds=u;}
+ @Override protected void doFilterInternal(HttpServletRequest req,HttpServletResponse res,FilterChain chain)throws ServletException,IOException{
+  String h=req.getHeader("Authorization"); if(h!=null&&h.startsWith("Bearer ")&&SecurityContextHolder.getContext().getAuthentication()==null){try{String t=h.substring(7); String name=jwt.username(t); UserDetails ud=uds.loadUserByUsername(name); SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(ud,null,ud.getAuthorities()));}catch(Exception ignored){}}
+  chain.doFilter(req,res);
+ }
+}
