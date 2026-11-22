@@ -12,6 +12,7 @@ EnglishMate 是一个面向大学生英语学习场景的 AI Web 应用，围绕
 - [技术栈](#技术栈)
 - [系统架构](#系统架构)
 - [核心实现](#核心实现)
+- [调试记录](#调试记录几个真踩过的坑)
 - [项目结构](#项目结构)
 - [运行环境](#运行环境)
 - [Docker Compose 启动](#docker-compose-启动推荐)
@@ -139,6 +140,50 @@ AI 聊天和作文批改使用用户维度的限流规则，默认每分钟最�
 ### 6. 作文批改与错题关联
 
 作文批改结果在成功后保存，便于用户查看历史记录，而不必每次重新调用模型。作文中的错误可以加入错题本，并通过掌握状态辅助后续复习。
+
+## 调试记录：几个真踩过的坑
+
+这一节记录开发过程中"看起来能跑、实际上不对"的问题，以及定位和修复方式。都是可以从代码里直接核对的具体实现。
+
+### 1. SSE 首字延迟：每个 chunk 都 flush 了，前端却要等两秒才出字
+
+**现象**：接口确实是流式返回，但浏览器一次收到一大段文字，而不是一个字一个字出现。
+
+**定位**：`StreamingResponseBody` 在 Spring 7 中拿到的是 `NonFlushingOutputStream`，`flush()` 调用被吞掉，数据要攒满 8 KB 才会真正写出去。也就是说，问题不在模型，也不在前端解析。
+
+**解决**：不再向 `StreamingResponseBody` 传入的输出流写数据，而是取出容器给的原生 `HttpServletResponse#getOutputStream()` 直接写（见 `ChatController#rawStream`），每写完一个 SSE 帧就 `writer.flush()` + `raw.flush()`；同时给响应加上 `X-Accel-Buffering: no`，让 Nginx 也不要缓冲。
+
+**核对位置**：`EnglishMate/ai-english-backend/src/main/java/com/english/assistant/controller/ChatController.java`
+
+### 2. 套上 Nginx 之后又变慢：`proxy_buffering` 默认是开着的
+
+**现象**：直连后端端口时是逐字输出，走 Nginx 的 80 端口又变回"一批一批"。
+
+**原因**：Nginx 反向代理默认开启响应缓冲，会先攒够缓冲区再往下游转发，后端 flush 得再勤也没用。
+
+**解决**：在 `nginx.conf` 的 `/api/` location 里关闭 `proxy_buffering` 和 `proxy_cache`，并把 `proxy_read_timeout` 提到 180 秒——模型长时间不出字时，默认的 60 秒会把连接掐断。
+
+**核对位置**：`EnglishMate/ai-english-assistant/nginx.conf`
+
+### 3. 刷新页面 404：前端路由被 Nginx 当成真实文件去找
+
+**现象**：从首页点进某个页面一切正常，按 F5 刷新就 404。
+
+**原因**：前端使用 history 路由，刷新时浏览器会真的向服务器请求 `/chat` 这类路径，而 Nginx 上没有这个文件。
+
+**解决**：`try_files $uri $uri/ /index.html;`，把找不到的路径统一回退到入口页，路由交给前端处理。
+
+**核对位置**：`EnglishMate/ai-english-assistant/nginx.conf`
+
+### 4. 两处"能跑但会出事"的写法
+
+这两处没有出现在线上，但属于自己回看代码时发现的隐患，记在这里也提醒自己。
+
+- **限流计数与过期不是原子的**：当前实现是 `INCR` 之后单独执行 `EXPIRE 60s`（只在首次计数时设置）。如果两条命令之间进程被终止，这个计数键就不会过期，该用户会被永久限流。更稳妥的做法是用 Lua 脚本把"自增 + 首次设过期"合成一次调用。
+  另外，Redis 不可用时 `RateLimitService` 直接 `return true`（放行），这是"可用性优先"的主动取舍，不是漏判。
+- **分布式锁的释放必须校验持有者**：`EssayGenerationGuardService` 用 `SET NX + 90 秒 TTL` 抢锁，释放时执行一段 Lua 先比对 token 再 `DEL`。否则锁因超时自动释放后，前一个请求的释放动作会把别人刚拿到的锁删掉。
+
+**核对位置**：`service/RateLimitService.java`、`service/EssayGenerationGuardService.java`
 
 ## 项目结构
 
